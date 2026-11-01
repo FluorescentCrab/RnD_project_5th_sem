@@ -419,7 +419,6 @@ Use MangoHud for FPS/frame time, `nvidia_smi_*.csv` for discrete-GPU truth, `per
 3. For Qwen, start Ollama in the intended placement (§1.3) **before** `run_batch.py`, and use separate results folders for the GPU and CPU passes.
 4. Do a 30 s single game (`python run_game.py glmark2 30`) and confirm both a MangoHud CSV and an `nvidia_smi_*.csv` appear.
 5. A full default sweep takes roughly 31 hours before cooldowns (§1.5).
-6. Do not `pip install -r` the repository-root `requirements.txt`; it is a full OS package dump, not an experiment environment file.
 
 ---
 ---
