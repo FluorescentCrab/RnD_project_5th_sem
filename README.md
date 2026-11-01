@@ -1096,27 +1096,5 @@ Reported thread siblings: `0-1`, `2-3`, `4-5`, `6-7`, `8-9`, `10-11` for the P-c
 
 Luanti build details: LuaJIT 2.1.1761786044 (OpenResty), built by GCC 15.2, running on Linux/7.0.0 x86_64, `BUILD_TYPE=Release`, `RUN_IN_PLACE=1`, `USE_CURL=1`, `USE_GETTEXT=1`, `USE_SOUND=1`, `STATIC_SHAREDIR="."`, `STATIC_LOCALEDIR="locale"`.
 
-### A.5 Run settings
-
-| Setting | Value |
-|---------|-------|
-| Duration per run | 240 s |
-| Padding before and after each run | 10 s |
-| Iterations per game | 3 |
-| Cooldown target (CPU and GPU) | 50 °C |
-| Demand sampler interval | 0.25 s |
-| `pidstat` interval | 1 s |
-| `cpu_log.py` interval | 30 ms |
-
-### A.6 Experiment 3 run settings
-
-| Setting | Value |
-|---------|-------|
-| Game window per run | 240 s (0 s padding) |
-| Runs per game per combination | 5 |
-| AI-alone period before the game | 120 s |
-| AI load timeout | 300 s |
-| Cooldown target (GPU and CPU) | 50 °C, timeout 600 s |
-| `cpu_log.py` interval | 30 ms |
-| Game CPUs | Xonotic `0-2`; glmark2, Luanti, SuperTuxKart `0-1` |
+uxKart `0-1` |
 | AI CPUs | with Xonotic `3-15`; with the others `2-15` |
