@@ -79,8 +79,6 @@ python run_batch.py --models qwen --results-dir results_ollama_cpu --per-core-di
 
 Each results folder has its own `state.json`, so the second pass starts fresh.
 
-**Note on Qwen logs:** `run_batch.py` always passes `--device gpu` to `run_ai_workload.py` for Qwen, so `ai_workload.log` shows “Device: cuda” for Qwen. This label only reflects PyTorch’s device choice, which Qwen does not use, and says nothing about where Ollama is running. For the same reason, the “Ollama uses its own background server” warning in `run_ai_workload.py` (printed only when `--device cpu` is passed) never appears in Qwen logs. Record the Ollama placement yourself (the folder name above does this).
-
 ### 1.4 Request intensity (how hard the AI is driven)
 
 Between successive AI requests the script sleeps:
