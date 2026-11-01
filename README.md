@@ -1095,6 +1095,3 @@ Reported thread siblings: `0-1`, `2-3`, `4-5`, `6-7`, `8-9`, `10-11` for the P-c
 | Luanti | 5.18.0-dev-b4eb8b9-dirty (Linux) | window set by the game (launched with `--go --random-input`) | off | 60 fps |
 
 Luanti build details: LuaJIT 2.1.1761786044 (OpenResty), built by GCC 15.2, running on Linux/7.0.0 x86_64, `BUILD_TYPE=Release`, `RUN_IN_PLACE=1`, `USE_CURL=1`, `USE_GETTEXT=1`, `USE_SOUND=1`, `STATIC_SHAREDIR="."`, `STATIC_LOCALEDIR="locale"`.
-
-uxKart `0-1` |
-| AI CPUs | with Xonotic `3-15`; with the others `2-15` |
