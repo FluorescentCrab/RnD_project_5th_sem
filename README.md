@@ -617,7 +617,7 @@ Written by `demand_profile.py` every 0.25 s. It samples `utime + stime` of **eve
 | `n_threads` | Threads seen |
 | `n_procs` | Processes in the session |
 
-The process list is refreshed every 1 s to pick up child processes started later. The rate is computed from the real elapsed time of each interval, not the nominal 0.25 s. `python demand_profile.py --summary demand.csv` (and `run_all.py` after each run) prints the p50 / p95 / max of total cores-worth, and the p95 of P-cores, E-cores and the busiest thread, **dropping the first 30 s** of the run as warm-up (or nothing, if the run is shorter than 30 s).
+The process list is refreshed every 1 s to pick up child processes started later. The rate is computed from the real elapsed time of each interval, not the nominal 0.25 s. `python demand_profile.py --summary demand.csv` (and `run_all.py` after each run) prints the p50 / p95 / max of total cores-worth, and the p95 of P-cores, E-cores and the busiest thread.
 
 ### 5.3 What is deleted
 
@@ -685,7 +685,6 @@ Points to keep in mind when interpreting results:
 - **Frame caps shape the result.** Luanti (60 fps) and SuperTuxKart (144 fps, vsync on) are limited by their caps, while Xonotic and glmark2 are uncapped and will use whatever CPU they can.
 - **P/E attribution is approximate.** Each thread's CPU time in an interval is credited to the core type it was on at the **end** of that interval.
 - **Sampling limits.** Kernel CPU time ticks are 10 ms, so intervals below about 0.2 s are noisy. Processes that start and exit between two 1 s session scans are not seen.
-- **The first 30 s are dropped** by the printed summary, as warm-up. Compute your own statistics from `demand.csv` if you want a different window.
 - **Compare with Experiment 1 with care.** Experiment 2 has no AI job running, uses padding, and holds the CPU in the `performance` governor (Appendix A).
 
 ---
