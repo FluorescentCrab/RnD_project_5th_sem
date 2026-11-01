@@ -62,7 +62,7 @@ The first mode is contention on the GPU (and whatever CPU the game and Python st
 2. **Pass 2 — Ollama off the GPU (AI on CPU).** Stop the running Ollama server, restart it so that inference runs on the CPU, and run the Qwen sweep again:
 
    ```
-   <cmd>
+   CUDA_VISIBLE_DEVICES=-1 OLLAMA_LLM_LIBRARY=cpu ollama serve
    ```
 
 Leave each server running for the whole pass. Switching mid-sweep would mix GPU and CPU traces in the same `_ollama` folders.
