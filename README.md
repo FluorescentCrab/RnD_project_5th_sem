@@ -701,104 +701,130 @@ Points to keep in mind when interpreting results:
 8. Keep the machine in the same state for all runs (power source, power mode, nothing else running). The setup used is listed in Appendix A.
 
 ---
----
 
-# Experiment 3 — Does separating CPU cores give performance back? (game and AI pinned to disjoint cores)
+# Experiment 3 — Pinned co-run of games and AI workloads (disjoint CPU cores)
 
 Experiment 3 asks a single question:
 
 > If the game and the AI job are each confined to their own set of CPU cores with `taskset`, does the game get back the performance it lost to the AI in Experiment 1?
 
-The setup is the Experiment 1 co-run (a game plus an AI job on the same machine), with one change: the **game is pinned to a small set of cores and the AI job is pinned to the remaining cores**, so the two can never compete for the same logical CPU.
+The setup is the Experiment 1 co-run (a game and an AI inference job running on the same machine at the same time) with one deliberate change: the **game is pinned to a small set of logical CPUs and the AI job is pinned to the remaining ones**, so the two can never be scheduled onto the same logical CPU. The games, their launch arguments, the 240 s window and the AI request loop are the same as before. What Experiment 3 adds is a set of checks that prove the split really held in every run (partition validation before launch, and read-backs of the real affinity masks afterwards).
+
+Pinning is the intended difference, but it is not the only one. Read §1.7 and §7 before comparing numbers with Experiment 1.
 
 ---
 
 ## 1. What is being tested
 
-### 1.1 Where this fits in the study
+### 1.1 Four games
 
-The CPU-partitioning study plan has these steps: confirm the topology (Step 1), measure each game's CPU demand alone (Step 2, **Experiment 2**), learn how to pin (Step 3), and run partition conditions (Step 4). Experiment 3 is the first partition test. It uses **one partition per game**, sized from the Experiment 2 demand data, and compares the result against the unpinned co-run of Experiment 1.
+The same four titles as Experiments 1 and 2 (Xonotic, glmark2, Luanti, SuperTuxKart), with the same resolution, demo file, random input and demo laps. The game is still forced onto the NVIDIA GPU by PRIME render offload (`__NV_PRIME_RENDER_OFFLOAD=1`, `__GLX_VENDOR_LIBRARY_NAME=nvidia`), so only the **CPU** side of the placement is new.
 
-The sweep in the plan's Step 4 has further conditions that Experiment 3 does not include; they are planned next steps:
+Pinning works like this: the launched command is `mangohud taskset -c <game cores> <game command>`. `taskset` execs the game, so the game and every thread and child process it creates inherit the mask. The game CPUs are **not** hardcoded in `GAMES_CONFIG`. They come from `--game-cores` (or, if that is absent, from `DEFAULT_GAME_CORES` in `run_game.py`), so the same launcher serves any partition. `--game-cores unpinned` removes the `taskset` entirely.
 
-| Plan condition | Status |
-|----------------|--------|
-| **U** — unpinned game and AI | Experiment 1 |
-| **A-m** — game on m physical cores, AI on all the rest | Experiment 3, at one m per game |
-| **GP-m** — game alone, pinned (control: does pinning itself hurt?) | Next step |
-| **B-m** — game on m physical cores, AI on E-cores only | Next step |
-| **C** — game on one SMT thread per core | Next step |
-| Sweep over m = 1–4 (to find the knee) | Next step |
-| Game-alone, unpinned baseline with FPS | Next step |
-| Run-queue wait metric (`schedwait.py` in the plan) | Next step |
+**This `run_game.py` is not the Experiment 1 launcher.** It adds the partition check, the affinity read-back and the telemetry pin (§6). Keep the two in separate folders.
 
-Without the GP control, a change relative to Experiment 1 mixes two effects: the benefit of isolation and the cost of restricting the game to few cores.
+The Xonotic and Luanti executables are absolute paths to a local disk inside `run_game.py`. On another machine they have to be edited. glmark2 and SuperTuxKart are expected as system commands.
 
-### 1.2 Four games
+### 1.2 Three AI workloads, two controllers
 
-The same four titles, resolutions and launch arguments as Experiments 1 and 2. Frame caps and vsync are as in Appendix A (Luanti 60 fps, SuperTuxKart 144 fps with vsync on, Xonotic and glmark2 uncapped). The game is forced onto the NVIDIA GPU by PRIME render offload, as before.
+| Name | Controller | How the request is defined |
+| --- | --- | --- |
+| **cnn** | `run_task.py` | CIFAR-10 ResNet20, one forward pass of a random batch (as Experiment 1 §1.2) |
+| **tinybert** | `run_task.py` | `prajjwal1/bert-tiny` on SST-2, one forward pass of up to 32 random sentences (as Experiment 1 §1.2) |
+| **qwen** | `run_task_ollama.py` | One non-streaming HTTP generate call to a local Ollama server (`qwen:0.5b`, Dolly-15k prompts, 120 s timeout) |
 
-The difference is in `run_game.py` for this experiment: **every game command starts with `taskset -c <cores>`**, so the game and all of its threads and child processes inherit that mask (MangoHud runs around `taskset`, which then starts the game).
+The AI script is `run_ai_workload.py`. For cnn and tinybert it is the process that runs the model, so `run_task.py` starts it under `taskset`. For qwen it only sends HTTP requests; the inference runs inside the Ollama server. Pinning the request script therefore does nothing for the model, so **you** start the Ollama server pinned (§1.3) and `run_task_ollama.py` only checks it and never changes it.
 
-### 1.3 Two AI workloads, two placements, four intensities
+### 1.3 Placement modes
 
-| Factor | Values |
-|--------|--------|
-| AI model | `cnn`, `tinybert` (Qwen is not run here) |
-| Placement | `gpu` (model on the NVIDIA GPU), `cpu` (model on the CPU) |
-| Intensity | `high`, `mid`, `low`, `idle` (the same sleep-after-each-request settings as Experiment 1 §1.4) |
-
-That is 2 × 2 × 4 = **16 combinations**. The AI script is `run_ai_workload.py`, unchanged from Experiment 1.
-
-Qwen is not included because its inference runs inside the separate Ollama server, which pinning the Python request script does not affect.
+| Mode | cnn and tinybert | qwen |
+| --- | --- | --- |
+| **gpu** | `--device gpu`: model on the NVIDIA GPU | Ollama started normally (default) |
+| **cpu** | `--device cpu`: model on the CPU | Ollama started with the GPU hidden (below) |
 
 The AI process is pinned in **both** placements. With the model on the GPU, the CPU-side work (request loop, tokenisation, kernel launches) is still confined to the AI's cores; with the model on the CPU, the inference itself is.
 
+For qwen, start the server pinned to the AI cores of the batch you are about to run:
+
+```bash
+taskset -c 4-15 ollama serve                                # xonotic, Ollama on GPU
+taskset -c 2-15 ollama serve                                # other games, Ollama on GPU
+CUDA_VISIBLE_DEVICES='' taskset -c 2-15 ollama serve        # other games, Ollama on CPU (use 4-15 for xonotic)
+```
+
+The script reads `/api/ps` and fails the run if qwen is not on the requested device (`gpu`, `cpu`, or `split` when only part of the model is in VRAM). Leave each server running for a whole batch; restarting it mid-batch would mix conditions in the same folders.
+
 ### 1.4 CPU partitions
 
-The core counts follow the plan's starting estimate: the game gets `ceil(p95 total cores-worth) + 1` logical CPUs, using the Experiment 2 demand data. The AI gets everything else.
+| Game | Game CPUs | AI CPUs | AI thread cap |
+| --- | --- | --- | --- |
+| Xonotic | `0-2` | `4-15` | 12 |
+| glmark2, Luanti, SuperTuxKart | `0-1` | `2-15` | 14 |
 
-| Game | Game CPUs | What that covers | AI CPUs |
-|------|-----------|------------------|---------|
-| Xonotic | `0-2` | P-core 0 (both threads) and one thread of P-core 1 | `3-15` |
-| glmark2 | `0-1` | P-core 0 (both threads) | `2-15` |
-| Luanti | `0-1` | P-core 0 | `2-15` |
-| SuperTuxKart | `0-1` | P-core 0 | `2-15` |
+CPU 3 is left idle with Xonotic on purpose: it is the SMT sibling of CPU 2, and the rule is that **a physical core belongs to one side only**.
 
-Logical CPUs 0–11 are P-core threads in sibling pairs (0,1), (2,3), …, (10,11), and 12–15 are E-cores (Appendix A.3).
+The partition is validated by `cpu_partition.py` before anything is launched, and again by `run_game.py` before the game starts. The check uses the real sibling pairs from `/sys/devices/system/cpu/cpuN/topology/thread_siblings_list` (not an assumed layout) and fails if any of these hold:
 
-- The **game** masks are the `taskset` prefixes in each `GAMES_CONFIG` entry in this experiment's `run_game.py`.
-- The **AI** masks are set by `run_task.py` through `--ai-cores-xonotic` (default `3-15`) and `--ai-cores-default` (default `2-15`).
+- a mask contains a CPU that does not exist on the machine;
+- the game and the AI (or the telemetry CPU) share a logical CPU;
+- a physical core with two or more threads is split between the game and the AI (or the telemetry CPU).
 
-`taskset` sets which CPUs a process **may** use; it does not guarantee where threads run. The scheduler still chooses among the allowed CPUs.
+The defaults can be overridden: `--game-cores` and `--ai-cores` apply to all selected games, `--ai-cores auto` means every CPU that does not share a physical core with the game, and `--game-cores-xonotic`, `--game-cores-default`, `--ai-cores-xonotic`, `--ai-cores-default` set the per-game defaults. The same check can be run by hand: `./cpu_partition.py 0-2 4-15`.
 
-### 1.5 Repeats and size
+**Thread cap.** A pinned process that starts more threads than it has CPUs would oversubscribe its own partition and look slower for reasons unrelated to interference. So the AI is capped to the partition size: `OMP_NUM_THREADS`, `MKL_NUM_THREADS` and `AI_NUM_THREADS` are set to that size, `run_ai_workload.py` is started with `--threads N` (torch intra-op threads and the Rust tokenizer pool), and for qwen the request carries `num_thread = N` so Ollama sizes its pool from the mask and not from the machine.
 
-For **each** combination and **each** game, the run is repeated **5 times**, each with a **240 s** game window. A new AI process is started for every run.
+`taskset` fixes which CPUs a process **may** use. It does not decide where its threads run: the scheduler still chooses among the allowed CPUs.
 
-Default sweep size: 16 combinations × 4 games × 5 runs = **320 runs**.
+### 1.5 Request intensity
 
-**Expected duration.** `run_task.py` estimates each run as 120 s (AI alone) + 240 s (game) + 20 s overhead = 380 s, so the full sweep is at least **33 h 46 m**. This excludes model loading and cooldown waits.
+The same sleep-after-each-request settings as Experiment 1 §1.4: `high` 0.05 s, `mid` 0.5 s, `low` 2.0 s, `idle` (no requests, the process sleeps 1 s at a time with the model resident).
+
+### 1.6 Repeats and size
+
+For **each** combination and **each** game, the run is repeated **5 times** with a **240 s** game window. A **new AI process is started for every run**.
+
+| Controller | Combinations | Runs | Estimated time |
+| --- | --- | --- | --- |
+| `run_task.py` (cnn, tinybert) | 2 models × 4 intensities × 2 devices = 16 | 16 × 4 games × 5 = **320** | at least **33 h 46 m** |
+| `run_task_ollama.py` (qwen), one device pass | 4 intensities | 4 × 4 games × 5 = **80** | at least **8 h 26 m** |
+
+Both scripts estimate each run as 120 s (AI alone) + 240 s (game) + 20 s overhead = 380 s. The estimates exclude model loading and cooldown waits. Qwen has to be split into batches by AI core set (Xonotic: 20 runs, about 2 h 06 m; the other three games: 60 runs, about 6 h 20 m), and the CPU placement is a second pass of the same size.
+
+### 1.7 How this differs from Experiment 1
+
+|  | Experiment 1 | Experiment 3 |
+| --- | --- | --- |
+| Game's CPUs | any | 2 or 3 logical CPUs |
+| AI's CPUs | any | the rest, minus any sibling of the game's cores |
+| AI thread cap | none | equal to the AI partition size |
+| AI lifecycle | one process per combination, 20 game runs back to back | a fresh process per run |
+| Before the game starts | AI at thermal steady state | cooled to 50 °C, then 120 s of AI alone |
+| Cooldown | adaptive target, GPU only, AI left running | fixed 50 °C on GPU **and** CPU, nothing running |
+| Per-core CPU log | whole combination | game window only |
+| Qwen | one sweep controlled by `run_batch.py` | separate controller, pinned server verified |
+| Verification | none | partition check, game and AI affinity read-back, Ollama affinity and device check |
+| Telemetry (`cpu_log.py`, `nvidia-smi`) | unpinned | optionally pinned to one CPU |
 
 ---
 
 ## 2. Temperature control
 
-Before **every** run, with nothing of ours running, `run_task.py` waits until both the GPU and the CPU are at or below the target:
+Before **every** run, with nothing of ours running, the controller waits until the GPU and the CPU are both at or below the target:
 
 | Setting | Default |
-|---------|---------|
+| --- | --- |
 | `--gpu-target` | 50 °C |
 | `--cpu-target` | 50 °C |
 | `--cooldown-timeout` | 600 s |
 | `--poll-interval` | 5 s |
 
-- GPU temperature comes from `nvidia-smi`. CPU temperature comes from the `coretemp` or `k10temp` sensor in `/sys/class/hwmon` (preferring `Package id 0`, `Tctl` or `Tdie`).
+- GPU temperature comes from `nvidia-smi`. CPU temperature comes from the `k10temp` or `coretemp` sensor in `/sys/class/hwmon` (preferring `Tctl`, `Tdie` or `Package id 0`, otherwise `temp1_input`).
 - `--no-cpu-wait` cools down on GPU temperature only.
-- If the target is not reached within the timeout, the run is **still performed** but marked `started_hot` in `meta.json`, and it is listed in `state.json` and in the final summary.
-- The starting temperatures are recorded in `meta.json` (`start_gpu_temp`, `start_cpu_temp`).
+- If the target is not reached within the timeout, the run is **still performed** but is flagged `started_hot` in `meta.json`, and it is listed in `state.json` and in the final summary.
+- The starting temperatures are stored in `meta.json` (`start_gpu_temp`, `start_cpu_temp`).
 
-Unlike Experiment 1, the cooldown is a fixed 50 °C on both devices, not an adaptive target based on the AI's own temperature.
+Unlike Experiment 1, the target is a fixed 50 °C on both devices, not the AI's own steady-state temperature plus a margin. After the cooldown, the AI runs alone for 120 s before the game starts, so the AI itself is warm at game start but the starting point is the same every time.
 
 ---
 
@@ -806,80 +832,94 @@ Unlike Experiment 1, the cooldown is a fixed 50 °C on both devices, not an adap
 
 ### 3.1 Machine and software
 
-- Linux (per-core logging reads `/proc/stat`)
+- Linux (the per-core logger and affinity checks read `/proc` and `/sys`)
 - NVIDIA driver with `nvidia-smi`
-- **MangoHud**, **`taskset`** (util-linux) on `PATH`. `pkill` and `pgrep` (procps) are used to stop the game cleanly, with a fallback if they are missing.
-- A Python environment with `torch`, `torchvision`, `transformers`, `datasets` and `requests` for the AI script. If it lives in a virtual environment, point `--ai-python` at it.
-- CUDA available to that Python if any `gpu` combination is run (otherwise the AI script silently falls back to the CPU; the preflight check refuses to start in that case).
-- A CPU temperature sensor (`coretemp`/`k10temp`), unless `--no-cpu-wait` is used.
+- **MangoHud** and **`taskset`** (util-linux) on `PATH`; `pgrep` is used to read thread affinities, and `pkill` to stop the game cleanly (with a fallback if it is missing)
+- Python with `torch`, `torchvision`, `transformers`, `datasets` and `requests` for the AI script. If it lives in a virtual environment, point `--ai-python` at it.
+- CUDA visible to that Python if any `gpu` combination is run. Otherwise the AI script would silently fall back to the CPU, so the preflight check refuses to start.
+- A CPU temperature sensor (`k10temp`/`coretemp`), unless `--no-cpu-wait` is used
+- For qwen: Ollama on `http://localhost:11434` with `qwen:0.5b` pulled, started pinned as in §1.3
 
 ### 3.2 Files and working directory
 
-- Run `run_task.py` from the folder that contains **this experiment's** `run_game.py`. `run_task.py` imports `GAMES_CONFIG` and the MangoHud staging folder from it.
-- `cpu_log.py` must sit next to `run_task.py`. `run_ai_workload.py` is found through `--ai-script` (default `run_ai_workload.py` in the current folder); it is run from its own folder, so the CIFAR-10 `data/` directory stays next to it.
-- **This `run_game.py` is not the same file as the Experiment 1 one.** It differs by the `taskset` prefixes and by Xonotic's path (relative: `../xonotic/xonotic/all`). Keep the two in separate folders.
-- Luanti's path is still an absolute local path (`/run/media/tanish/...`) and would have to be changed on another machine.
-- `run_ai_workload.py` and `cpu_log.py` are identical to the Experiment 1 versions.
+Put these in **one folder** and run the controllers from it: `run_task.py`, `run_task_ollama.py`, `run_game.py`, `cpu_partition.py`, `cpu_log.py`.
+
+- The controllers import `GAMES_CONFIG`, `DEFAULT_GAME_CORES` and the MangoHud staging folder (`./mangohud_raw`, relative to the working directory) from `run_game.py`, and they call it by relative name, so the working directory must contain it.
+- `run_ai_workload.py` is found through `--ai-script` and is run from its own folder, so the CIFAR-10 `data/` directory stays next to it.
+- Use a folder that does not hold Experiment 1 or Experiment 2 staging files, because they use the same `mangohud_raw` name.
 
 ### 3.3 Command-line inputs
 
-Full default sweep:
+Full cnn and tinybert sweep:
 
 ```bash
 python run_task.py
 ```
 
 | Argument | Default | Meaning |
-|----------|---------|---------|
+| --- | --- | --- |
 | `--runs` | 5 | Runs per game per combination |
 | `--duration` | 240 | Game window in seconds |
-| `--models` | cnn tinybert | AI models |
+| `--models` | cnn tinybert | AI models (`run_task.py` only) |
 | `--intensities` | high mid low idle | Request intensities |
-| `--devices` | gpu cpu | AI placement |
-| `--games` | all four | Games to run |
-| `--ai-cores-xonotic` | `3-15` | `taskset` cores for the AI while the game is Xonotic |
-| `--ai-cores-default` | `2-15` | `taskset` cores for the AI with every other game |
+| `--devices` | gpu cpu (qwen: gpu) | Placement. For qwen it must match how you started Ollama |
+| `--games` | all four (qwen: games sharing one AI core set per batch) | Games to run |
+| `--game-cores` | per-game default | Game CPUs for all selected games, or `unpinned` |
+| `--ai-cores` | per-game default | AI CPUs for all selected games, or `auto` |
+| `--game-cores-xonotic` / `--game-cores-default` | `0-2` / `0-1` | Per-game game CPUs |
+| `--ai-cores-xonotic` / `--ai-cores-default` | `4-15` / `2-15` | Per-game AI CPUs |
+| `--telemetry-cpu` | off | Pin `cpu_log.py` and the `nvidia-smi` sidecar to this one CPU |
 | `--gpu-target` / `--cpu-target` | 50 / 50 | °C to reach before each run |
 | `--no-cpu-wait` | off | Cool down on GPU temperature only |
 | `--cooldown-timeout` | 600 | Max seconds for the cooldown |
 | `--poll-interval` | 5 | Seconds between temperature checks |
 | `--ai-solo-wait` | 120 | Seconds the AI runs alone before the game starts |
 | `--ready-timeout` | 300 | Max seconds for the AI model to load |
-| `--ai-script` | `run_ai_workload.py` | Path to the AI script |
-| `--ai-python` | current Python | Interpreter used for the AI script |
-| `--results-dir` | `result_task` | Where results are written |
-| `--cpu-interval` | 30 | Per-core CPU sampling interval in ms |
-| `--fresh` | off | Ignore saved progress and redo everything |
-| `--dry-run` | off | Print the plan only |
-| `--skip-preflight` | off | Skip the startup checks |
+| `--ai-script` / `--ai-python` | `run_ai_workload.py` / current Python | AI script and interpreter |
+| `--results-dir` | `result_task` (qwen: `result_task_ollama`) | Where results are written |
+| `--cpu-interval` | 30 | Per-core sampling interval in ms |
+| `--fresh` / `--dry-run` / `--skip-preflight` | off | Redo everything / print the plan only / skip startup checks |
+| `--no-check-affinity` / `--no-verify-device` | off | qwen only: skip the Ollama affinity check / the `/api/ps` device check |
 
-Example of a reduced run:
+Examples:
 
 ```bash
 python run_task.py --runs 3 --models cnn --intensities high mid --devices gpu
+python run_task.py --ai-cores auto --telemetry-cpu 15
+python run_task_ollama.py --games xonotic                     # server started with taskset -c 4-15
+python run_task_ollama.py --games glmark2 luanti supertuxkart  # server restarted with taskset -c 2-15
 ```
 
-The preflight check verifies that `run_game.py` and `cpu_log.py` exist, `/proc/stat` is present, the AI script exists, `nvidia-smi`, `mangohud` and `taskset` are on `PATH`, the GPU (and CPU) temperature can be read, every game executable exists, and PyTorch can see CUDA if `gpu` combinations are requested.
+**Preflight.** Before the first run, `run_task.py` checks that `run_game.py`, `cpu_log.py`, `/proc/stat` and the AI script exist; that `nvidia-smi`, `mangohud` and `taskset` are on `PATH`; that the GPU (and CPU) temperature can be read; that every game executable exists; that the partition is valid for every selected game; and that PyTorch sees CUDA when `gpu` combinations are requested. `run_task_ollama.py` does the same for its games and also checks that Ollama is reachable, that `qwen:0.5b` is pulled, that the server's affinity matches the first game's AI cores, that all selected games use the **same** AI cores (otherwise it asks for separate batches), and that the AI interpreter can import its modules.
 
 ---
 
 ## 4. What one run does, in order
 
-For one (model, intensity, device) combination, one game and one run number `k`:
+For one combination, one game and one run number `k` (cnn and tinybert):
 
-1. Create `result_task/<combo>/<game>/run_<k>/`. If that folder already exists from an interrupted attempt, rename it with a `_prev_<timestamp>` suffix so the files are not mixed.
+1. Create `result_task/<combo>/<game>/run_<k>/`. If it already exists from an interrupted attempt, rename it with a `_prev_<timestamp>` suffix so files are not mixed.
 2. **Cool down** until GPU and CPU are ≤ 50 °C (§2) and record the starting temperatures.
-3. Start the AI job under `taskset` on the AI cores (`3-15` for Xonotic, `2-15` otherwise), writing `ai_workload.log` and `ai_requests.csv`.
-4. **Wait until the model has loaded**, meaning `Starting <model>` appears in the AI log (up to `--ready-timeout`, 300 s).
-5. **AI runs alone** for `--ai-solo-wait` (120 s), so the game always starts against an AI that is already running.
-6. Start `cpu_log.py` (30 ms), writing `cpu_percore.csv`.
-7. Run `run_game.py <game> 240 --padding 0`, which starts MangoHud and the pinned game, logs the NVIDIA GPU with `nvidia-smi`, and stops the game after 240 s. MangoHud logs for the first 230 s so its CSV is closed before the game is killed.
-8. Stop `cpu_log.py` with SIGINT, so the per-core log covers only the game window.
-9. Move the new MangoHud and `nvidia-smi` files from `mangohud_raw/<game>/` into the run folder.
-10. Stop the AI job with SIGINT, so it prints its throughput and latency summary into `ai_workload.log`.
-11. Write `meta.json` and record the run in `state.json`.
+3. Start the AI under `taskset` on the AI cores, with the thread cap, writing `ai_workload.log` and `ai_requests.csv`.
+4. **Wait until the model has loaded**, meaning `Starting <model>` appears in the AI log (up to `--ready-timeout`). The run fails if the AI exits first.
+5. Save the AI's real affinity (`taskset -a -c -p`, every thread) to `ai_affinity.txt`.
+6. **AI runs alone** for `--ai-solo-wait` (120 s), so the game always starts against an AI that is already running.
+7. Start `cpu_log.py` (30 ms), writing `cpu_percore.csv`.
+8. Run `run_game.py <game> 240 --padding 0 --game-cores <..> --ai-cores <..>`, which:
+   1. checks the partition again and exits with code 2 if it is not clean;
+   2. starts MangoHud, the pinned game and the `nvidia-smi` sidecar (100 ms);
+   3. after 5 s, reads the allowed CPUs of **every thread** of every process in the game's session and writes them to `game_affinity_<timestamp>.txt` with a status of `OK`, `MISMATCH` or `NO THREADS FOUND`;
+   4. stops the game after 240 s (SIGINT, then SIGKILL after 10 s), waits 3 s for the MangoHud flush, and stops `nvidia-smi`.
 
-A run counts as failed if the AI exits early, never becomes ready, `run_game.py` exits non-zero, or no MangoHud CSV was produced. Partial data from a failed run is kept, the failure is recorded, and the sweep moves on.
+   MangoHud logs for the first 230 s so its CSV is closed before the game is killed. Meanwhile the controller checks every 2 s that the AI is still alive.
+9. Stop `cpu_log.py` with SIGINT, so the per-core log covers only the game window.
+10. Move the new files from `mangohud_raw/<game>/` into the run folder.
+11. Stop the AI with SIGINT, so it prints its throughput and latency summary into `ai_workload.log`.
+12. Write `meta.json` and record the run in `state.json`.
+
+A run counts as failed if the AI exits early or never becomes ready, `cpu_log.py` does not start, `run_game.py` exits non-zero (including a bad partition), or no MangoHud CSV was produced. Partial data from a failed run is kept, the failure is recorded, and the sweep moves on. An affinity `MISMATCH` does **not** fail the run: it prints a warning and is written to `game_affinity_<timestamp>.txt`, so check that file before using the run.
+
+**Qwen differences (`run_task_ollama.py`).** The first step is to check that every Ollama process (`ollama` and `ollama_llama_server`) is allowed on exactly the AI cores, **before** the cooldown, so a wrong server fails fast. The qwen client (not the server) is started under `taskset` on the AI cores. After the model has loaded, the Ollama affinity is checked again, because the runner process only exists once the model is loaded, and `/api/ps` is read to confirm the device (skipped for `idle`, where no requests are sent). The rest is identical.
 
 If you interrupt with Ctrl+C, run the same command again: completed runs are skipped and failed ones are retried.
 
@@ -890,154 +930,151 @@ If you interrupt with Ctrl+C, run the same command again: completed runs are ski
 ### 5.1 Directory layout
 
 ```text
-result_task/
+result_task/                           (qwen: result_task_ollama/)
   state.json
-  <model>_<intensity>_<device>/        e.g. cnn_high_gpu
+  <model>_<intensity>_<device>/        e.g. cnn_high_gpu, qwen_mid_cpu
     <game>/                            xonotic, glmark2, luanti, supertuxkart
       run_1/ … run_5/
-        <mangohud>.csv                 game trace (frame time, FPS, CPU/GPU sensors)
+        <mangohud>.csv                 game trace (FPS, frame time, CPU/GPU sensors)
         <mangohud>_summary.csv         MangoHud's own averages
-        nvidia_smi_<timestamp>.csv     GPU trace from nvidia-smi (100 ms)
+        nvidia_smi_<timestamp>.csv     GPU trace (100 ms)
+        game_affinity_<timestamp>.txt  allowed CPUs of every game thread
         ai_workload.log                AI stdout, with the final summary
         ai_requests.csv                one row per AI request
+        ai_affinity.txt                allowed CPUs of every AI thread
         cpu_percore.csv                per-core busy %, game window only
         meta.json                      description of the run
 ```
 
 ### 5.2 `state.json`
 
-Progress file for the sweep: `completed` (run keys that finished), `failed` (run key → error), and `hot` (runs that started above the cooldown target).
+Progress file: `completed` (run keys that finished), `failed` (run key → error) and `hot` (runs that started above the cooldown target). It is the resume mechanism.
 
 ### 5.3 `meta.json`
 
 | Key | Meaning |
-|-----|---------|
+| --- | --- |
 | `combo`, `model`, `intensity`, `device`, `game`, `run` | The factors |
 | `duration_s` | Game window (240) |
 | `status` | `ok`, `failed`, `interrupted` or `incomplete` |
 | `started`, `finished` | Local ISO timestamps |
-| `started_hot` | True if the cooldown target was not reached in time |
-| `start_gpu_temp`, `start_cpu_temp`, `gpu_target`, `cpu_target` | Temperatures at the start and the targets |
-| `ai_cores` | The `taskset` mask given to the AI (the game's mask is not stored here; it is the `taskset` prefix in `run_game.py`) |
+| `started_hot`, `start_gpu_temp`, `start_cpu_temp`, `gpu_target`, `cpu_target` | Cooldown outcome |
+| `game_cores`, `ai_cores`, `ai_threads` | The two masks and the AI thread cap |
+| `telemetry_cpu` | CPU the loggers were pinned to, or null |
 | `per_core_csv`, `cpu_interval_ms` | The per-core log and its interval |
 | `game_started_epoch`, `game_finished_epoch` | Unix times of the game window, for aligning logs |
-| `mangohud_csvs` | Number of MangoHud CSVs collected (summary and `nvidia_smi` files excluded) |
+| `mangohud_csvs` | Number of MangoHud CSVs collected (summary, `nvidia_smi` and affinity files excluded) |
 | `ai_requests` | `total_requests`, `fulfilled`, `failed`, parsed from the AI log |
+| `ollama_model`, `ollama_affinity_pre`, `ollama_affinity`, `ollama_device_actual` | qwen only: the server checks and what they found |
 | `error` | Set if the run failed |
 
 ### 5.4 MangoHud and `nvidia-smi` files
 
-Same configuration and columns as Experiment 1 (§5.5, §5.6): MangoHud at 100 ms with `log_duration` 230 s, and `nvidia-smi` sampled every 100 ms. These are the game-side results: frame times and FPS from MangoHud, and the discrete GPU's utilisation, temperature, power, clocks and memory from `nvidia-smi`.
+Same configuration and columns as Experiment 1 §5.5 and §5.6: MangoHud at 100 ms with `log_duration` 230 s, and `nvidia-smi` every 100 ms. These are the game-side results: frame times and FPS from MangoHud, and the discrete GPU's utilisation, temperature, power, clocks and memory from `nvidia-smi`.
 
 ### 5.5 `ai_workload.log` and `ai_requests.csv`
 
-The log has the model-load messages, up to five request errors, and the final summary (total, fulfilled and failed requests, throughput, mean latency, min/p50/p95/p99/max). `ai_requests.csv` has one row per request:
+The log holds the load messages, the thread-cap line, up to five request errors, and the final summary (total, fulfilled and failed requests, throughput, mean latency, min/p50/p95/p99/max). `ai_requests.csv` has one row per request:
 
 | Column | Content |
-|--------|---------|
+| --- | --- |
 | `request_id` | 1, 2, 3 … |
 | `epoch_s` | Wall-clock start of the request, aligned with the other logs |
 | `elapsed_s` | Seconds since the AI loop started |
 | `latency_ms` | Request latency |
 | `ok` | 1 if it succeeded |
-| `tokens` | Empty for `cnn` and `tinybert` |
+| `tokens` | Tokens generated (qwen only; empty for cnn and tinybert) |
 
-These files cover the AI-only period, the game window and the few seconds around it, because the AI runs for the whole run. Use `game_started_epoch` and `game_finished_epoch` to select the game window.
+The AI runs for the whole run, so these files include the 120 s AI-alone period. Use `game_started_epoch` and `game_finished_epoch` to select the game window.
 
-### 5.6 `cpu_percore.csv`
+### 5.6 `game_affinity_<timestamp>.txt` and `ai_affinity.txt`
 
-Written by `cpu_log.py` at 30 ms, starting just before the game and stopping right after it:
+These two files are the proof that each process stayed on its own side. `game_affinity_*.txt` starts with the expected mask, the thread count, the distinct masks and a status line, then lists `pid tid comm cpus_allowed_list` for every game thread. `ai_affinity.txt` is the raw `taskset -a -c -p` output for the AI process (for qwen, the client only; the server is checked separately and stored in `meta.json`). Every thread should show exactly its partition.
+
+### 5.6a `cpu_percore.csv`
+
+Written by `cpu_log.py` at 30 ms, starting just before the game and stopping right after it.
 
 | Column | Content |
-|--------|---------|
+| --- | --- |
 | `timestamp` | Unix epoch seconds |
 | `elapsed_s` | Seconds since the logger started |
 | `cpu0` … `cpu15` | Busy % of each logical CPU over the last interval |
 
-This is the check that the partition held: load from the game should sit on its CPUs, and load from the AI on the AI's CPUs.
+This is the behavioural check that the partition held: the game's load should sit on its CPUs and the AI's load on the AI's CPUs.
 
 ---
 
 ## 6. Scripts used in Experiment 3
 
-### `run_task.py` — controller
+### `run_task.py` — controller for cnn and tinybert
 
-Builds the list of (model × intensity × device × game × run) items, runs the preflight, and performs each run as in §4. It stores progress in `state.json` for resuming, marks runs that began hot, and prints a summary of completed, hot and failed runs at the end. Unlike `run_batch.py` in Experiment 1, it starts a fresh AI process for every run.
+Builds the list of (model × intensity × device × game × run) items, runs the preflight, and performs each run as in §4. It keeps progress in `state.json`, marks runs that started hot, and prints a summary of completed, hot and failed runs at the end. It also holds the helpers `run_task_ollama.py` reuses (cooldown, AI start and stop, CPU logging, game launch, result collection).
+
+### `run_task_ollama.py` — controller for qwen
+
+The same flow for the Ollama workload, with the additional server checks (affinity, device, model pulled) and the one-AI-core-set-per-batch rule. It never starts, stops or re-pins Ollama.
 
 ### `run_game.py` — one game, one timed run (pinned version)
 
-The Experiment 1 launcher with `taskset -c …` added to each game command. It still starts MangoHud, the `nvidia-smi` logger and the game in a new process session, stops the game after the duration, and waits 3 s for the MangoHud flush. `run_task.py` calls it with `--padding 0`.
+Holds `GAMES_CONFIG` and `DEFAULT_GAME_CORES`. It validates the partition, launches `mangohud` + `taskset` + game in a new process session, runs the `nvidia-smi` sidecar, writes the game affinity read-back, and stops the game after the duration. `--telemetry-cpu` pins the `nvidia-smi` sidecar to one CPU.
 
-### `run_ai_workload.py` and `cpu_log.py`
+### `cpu_partition.py` — partition helper
 
-Identical to Experiment 1. `run_task.py` runs the AI script under `taskset`.
+Parses and formats CPU lists, reads the real SMT sibling groups from sysfs, validates a partition, and computes `auto` AI cores. It can also be run directly as a standalone check.
+
+### `run_ai_workload.py` — the AI job
+
+Loads one of cnn, tinybert or qwen and issues requests at the chosen intensity until its duration ends or it receives SIGINT. It adds `--threads` (or `$AI_NUM_THREADS`) for the thread cap and `--log-csv` for the per-request log.
+
+### `cpu_log.py` — per-core utilisation
+
+Unchanged: per-core busy % from `/proc/stat` every 30 ms.
 
 ---
 
 ## 7. How to read the data
 
-### 7.1 What each file answers
-
 | Question | Where to look |
-|----------|---------------|
-| Did the game keep its frame rate and frame-time quality? | MangoHud CSV: mean FPS, 1 % low FPS, p99 frame time, share of frames over the frame-time target |
+| --- | --- |
+| Did the partition hold? | `game_affinity_*.txt`, `ai_affinity.txt`, `meta.json` (Ollama checks), then `cpu_percore.csv` |
+| Did the game keep its frame rate and frame-time quality? | MangoHud CSV: mean FPS, 1 % low FPS, p99 frame time |
 | Did the GPU behave differently? | `nvidia_smi_*.csv`: utilisation, clocks, power, temperature |
-| What did the AI pay for the isolation? | `ai_requests.csv` and `ai_workload.log`: throughput and latency of fulfilled requests |
-| Did the partition actually hold? | `cpu_percore.csv`: busy % on the game's CPUs vs the AI's CPUs |
+| What did the AI pay for the isolation? | `ai_requests.csv` and `ai_workload.log`: throughput and latency |
 | Did the run start under comparable conditions? | `meta.json`: `started_hot`, `start_gpu_temp`, `start_cpu_temp` |
 
-### 7.2 Method (from the study plan)
+Suggested analysis, for each (model, intensity, device, game):
 
-- Analyse from the **raw frame times**, not per-second FPS plots.
-- **Discard the first 60 s** of each game run.
-- Report the mean and 95 % confidence interval across the 5 runs.
-- **Game degradation** = percentage drop in 1 % low FPS relative to the reference (for example Experiment 1's unpinned co-run with the same combination, or the unpinned game-alone baseline when it exists). Do the same for p99 frame time and the share of frames over the frame-time target.
-- **AI cost** = change in throughput and latency relative to the unpinned co-run.
-- Define "degradation removed" as: the pinned-with-AI confidence interval overlaps the pinned game-alone (GP) confidence interval. Without the GP control, an improvement over Experiment 1 cannot be attributed to isolation alone.
-- If degradation is gone with a clean split, scheduling contention was the cause. If some remains, the cause lies in shared resources that pinning does not separate (L3 cache, memory bandwidth, power and thermal budget, and the GPU for `gpu` placements).
+- **Check the partition first.** Drop or flag any run whose `game_affinity_*.txt` status is not `OK`, whose `ai_affinity.txt` shows another mask, or whose Ollama checks failed.
+- Use the **raw frame times** from MangoHud, discard a warm-up at the start of the game window, and report the mean and a 95 % confidence interval across the 5 runs.
+- **Game degradation** is the percentage drop in 1 % low FPS and the rise in p99 frame time relative to the unpinned co-run of Experiment 1 with the same combination.
+- **AI cost** is the change in throughput and latency relative to the same Experiment 1 combination.
+- If degradation is gone with a clean split, CPU scheduling contention was the cause. If some remains, the cause is in resources that core pinning does not separate (see below).
 
-### 7.3 Comparing with Experiment 1
+Points to keep in mind when interpreting results:
 
-The game launch arguments, the 240 s window, 0 s padding, the MangoHud settings, 5 runs per combination and the AI script are the same, so MangoHud results are directly comparable. Other conditions are not identical:
-
-| Factor | Experiment 1 | Experiment 3 |
-|--------|--------------|--------------|
-| Game's CPU freedom | Any core | 2–3 logical CPUs |
-| AI's CPU freedom | Any core | Cores 2–15 (3–15 with Xonotic) |
-| AI lifecycle | One AI process per combination, 20 game runs back to back | A fresh AI process for every run |
-| Thermal state at game start | AI at steady state, about baseline + 2 °C | Cooled to 50 °C, then 120 s of AI alone |
-| Cooldown | Waits while the AI keeps running, GPU only | Waits with nothing running, GPU and CPU |
-| CPU log window | Whole combination | Game window only |
-| AI models | `cnn`, `tinybert`, `qwen` | `cnn`, `tinybert` |
-
-Check `start_gpu_temp` and `start_cpu_temp` before attributing a difference to pinning, since a cooler start can raise boost clocks on its own. The `idle` intensity (model loaded, no requests) is the closest thing to a control inside this experiment. Frame caps limit what degradation can show for capped games (Luanti 60 fps, SuperTuxKart 144 fps).
+- **There is no pinned game-alone control in this sweep.** Confining a game to two or three logical CPUs can cost performance by itself, so an improvement or a loss against Experiment 1 mixes isolation with the effect of the small partition. The `idle` intensity (model loaded, no requests) is the nearest control inside the sweep. A pinned game-alone run can be made by calling `run_game.py <game> 240 --game-cores <mask>` directly.
+- **The partitions are small.** Most games get one physical core (two SMT threads), Xonotic one and a half. Compare with the demand measured in Experiment 2.
+- **Isolation is only at the CPU-core level.** The L3 cache, memory bandwidth, the package's power and thermal budget, and (for `gpu` placements) the GPU are still shared.
+- **Not everything is pinned.** The controller, the desktop compositor, interrupts and kernel threads can run on any core. `cpu_log.py` and the `nvidia-smi` sidecar are free too, unless `--telemetry-cpu` is used. The partition check compares the telemetry CPU with the **game's** CPUs only, so the telemetry CPU normally lands inside the AI partition. Pick it deliberately and use the same one in every condition.
+- **Intensity is a sleep, not a request rate.** The achieved rate depends on latency, so use `ai_requests.csv` for the real throughput.
+- **A cooler start can raise boost clocks.** Check `start_gpu_temp` and `start_cpu_temp` before crediting a difference to pinning. Experiment 1 started games against a warm, steady-state AI; here the machine is cooled first.
+- **Frame caps limit what degradation can show** for the capped games (Luanti 60 fps, SuperTuxKart 144 fps with vsync).
+- **Qwen is only as pinned as the server you started.** The scripts verify it, but a server restarted between batches is the operator's responsibility.
 
 ---
 
-## 8. Design choices and limitations
+## 8. Practical notes for a third party repeating the run
 
-1. **Xonotic's split goes through a physical core.** The mask `0-2` / `3-15` puts logical CPU 2 on the game side and its SMT sibling, CPU 3, on the AI side, so the two can share P-core 1's execution units and caches. The scheduler tends to avoid a busy core's sibling when other CPUs are idle, so the overlap is more likely when the AI uses many threads (CPU-placed AI at high intensity). `cpu_percore.csv` shows it: look for `cpu3` busy at the same time as `cpu2`. The other three games never share a physical core with the AI. The plan's rule is to allocate whole physical cores. The AI-side mask can be changed with `--ai-cores-xonotic`, and the game-side mask in `run_game.py`.
-2. **Two logical CPUs are one physical core.** `0-1` is the two SMT threads of P-core 0, so most games are confined to one physical core.
-3. **No AI thread cap.** `run_task.py` applies `taskset` but does not set `OMP_NUM_THREADS`, `MKL_NUM_THREADS` or PyTorch's thread count, so a CPU-placed AI uses however many threads PyTorch chooses under the mask.
-4. **The game's mask is not saved per run.** It is fixed in `run_game.py`; `meta.json` stores only the AI mask.
-5. **Intensity is a sleep, not a request rate.** The AI sleeps after each request, so the achieved rate depends on latency. Use `ai_workload.log` and `ai_requests.csv` for the achieved throughput.
-6. **Isolation is only at the CPU-core level.** The L3 cache, memory bandwidth, the package's power and thermal budget, and (for `gpu` placement) the GPU are still shared.
-7. **Some processes are not pinned.** `run_task.py`, `cpu_log.py`, the `nvidia-smi` logger, `run_game.py`, the desktop compositor, interrupts and kernel threads can run on any core, including the game's.
-8. **No pinned game-alone control, no run-queue wait metric and no sweep over core counts yet** (§1.1).
-
----
-
-## 9. Practical notes for a third party repeating the run
-
-1. Put this experiment's `run_game.py` (with `taskset`), `run_task.py` and `cpu_log.py` in one folder, separate from the Experiment 1 folder, and run `run_task.py` from there.
-2. Change the Luanti path in `run_game.py` if your install differs. Xonotic's relative path must resolve from the folder you run in.
-3. Check your CPU layout (Appendix A.3) before reusing the core masks. They assume 12 P-core threads (0–11) in sibling pairs and 4 E-cores (12–15).
+1. Put `run_task.py`, `run_task_ollama.py`, `run_game.py`, `cpu_partition.py` and `cpu_log.py` in one folder, separate from the Experiment 1 and 2 folders, and run from there.
+2. Edit the Xonotic and Luanti paths in `run_game.py` if your install locations differ.
+3. **Check your CPU layout before reusing the masks.** Run `./cpu_partition.py 0-2 4-15` (and `0-1 2-15`); it should print `OK`. On a machine with a different SMT layout the preflight will refuse to start, which is the intended behaviour.
 4. Look at the plan first with `python run_task.py --dry-run`.
-5. Do a short test run, for example `python run_task.py --runs 1 --games glmark2 --models cnn --intensities high --devices gpu --duration 60`, and check that `run_1/` contains a MangoHud CSV, an `nvidia_smi` CSV, `ai_workload.log`, `ai_requests.csv`, `cpu_percore.csv` and `meta.json`.
-6. Verify the pinning on a real run: in `cpu_percore.csv`, load from the AI should sit on the AI's CPUs, and the game's load should sit on CPUs `0-1` (or `0-2`).
-7. The sweep takes more than a day and a half. Use `--runs`, `--models`, `--intensities`, `--devices` and `--games` to cut it down, and run the most informative combinations first.
-8. Keep the machine in the same state across runs (AC power, power mode, nothing else running). The setup used is in Appendix A.
-
+5. Do a short test, for example `python run_task.py --runs 1 --games glmark2 --models cnn --intensities high --devices gpu --duration 60`, and confirm that `run_1/` contains a MangoHud CSV, an `nvidia_smi` CSV, `game_affinity_*.txt` with status `OK`, `ai_affinity.txt`, `ai_workload.log`, `ai_requests.csv`, `cpu_percore.csv` and `meta.json`.
+6. Verify the pinning on a real run: in `cpu_percore.csv`, the game's load should sit on CPUs `0-1` (or `0-2`) and the AI's load on the AI CPUs.
+7. For qwen, run one batch per AI core set, restarting `ollama serve` with the matching `taskset` between batches, and use a separate pass (with the GPU hidden) for the CPU placement.
+8. The cnn and tinybert sweep takes more than a day and a half. Use `--runs`, `--models`, `--intensities`, `--devices` and `--games` to cut it down, and run the most informative combinations first.
+9. Keep the machine in the same state across runs (AC power, power mode, nothing else running). The setup used for the reported runs is in Appendix A.
 
 ---
 
@@ -1095,3 +1132,4 @@ Reported thread siblings: `0-1`, `2-3`, `4-5`, `6-7`, `8-9`, `10-11` for the P-c
 | Luanti | 5.18.0-dev-b4eb8b9-dirty (Linux) | window set by the game (launched with `--go --random-input`) | off | 60 fps |
 
 Luanti build details: LuaJIT 2.1.1761786044 (OpenResty), built by GCC 15.2, running on Linux/7.0.0 x86_64, `BUILD_TYPE=Release`, `RUN_IN_PLACE=1`, `USE_CURL=1`, `USE_GETTEXT=1`, `USE_SOUND=1`, `STATIC_SHAREDIR="."`, `STATIC_LOCALEDIR="locale"`.
+
